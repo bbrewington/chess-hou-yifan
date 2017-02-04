@@ -1,0 +1,143 @@
+---
+title: "Chess Master Pairings"
+output: html_notebook
+---
+
+```{r Load Libraries, echo=F}
+library(dplyr); library(rvest); library(stringr); library(ggplot2)
+library(forcats); library(tidyr)
+```
+
+### Scrape data from chess-results.com
+```{r Get Masters Data: 1}
+page <- "http://www.chess-results.com/tnr257693.aspx?lan=1&art=0&wi=821&zeilen=99999"
+page_html <- read_html(page)
+masters <- page_html %>% html_nodes("#_ctl0_F7 > div:nth-child(2) > table") %>% html_table() %>% .[[1]]
+names(masters) <- masters[1,]
+names(masters)[2] <- "rating_category"
+masters <- masters %>% slice(-1) %>% 
+     mutate(player_id = `No.`, name = Name, fide_id = FideID,
+            country = FED, rating = as.integer(Rtg)) %>%
+     select(player_id, fide_id, name, country, rating_category, rating)
+
+FideID_links <- page_html %>% html_nodes("td:nth-child(4) a") %>% html_attr("href")
+masters$fideid_links <- FideID_links
+
+```
+
+### Get gender data from each player's page
+```{r Get Masters Data: 2}
+get_gender <- function(player_page){
+     player_page_html <- read_html(player_page)
+     gender <- player_page_html %>% 
+          html_nodes(".contentpaneopen table td:nth-child(1) tr:nth-child(7) td:nth-child(2)") %>% 
+          html_text() %>% str_trim()
+     if(length(gender) != 1){
+          return(NA)
+     } else
+     {
+          return(gender)          
+     }
+}
+
+gender_list <- vector(mode = "list", length = nrow(masters))
+for(i in seq_along(gender_list)){
+     print(paste0("Getting # ", i))
+     print(paste0("Link: ", masters$fideid_links[i]))
+     gender_list[[i]] <- get_gender(masters$fideid_links[i])
+}
+
+masters$gender <- gender_list %>% unlist()
+```
+
+### Clean & Summarize Masters Data
+```{r Get Masters Data: 3}
+masters_gender_manual <- 
+     tribble(
+          ~fide_id, ~gender,
+          "24614386", "Male",
+          "1400231", "Male",
+          "24165514", "Male",
+          "14105870", "Female",
+          "405256", "Male",
+          "8500150", "Male",
+          "620165", "Male",
+          "9100075", "Male"
+     )
+
+masters <- 
+     left_join(masters, masters_gender_manual, by = "fide_id") %>% 
+     mutate(gender = ifelse(is.na(gender.x), gender.y, gender.x)) %>% 
+     select(-gender.x, -gender.y, player_id:name, gender, country:fideid_links)
+
+#Display & Summarise Masters data
+masters
+masters %>% group_by(rating_category) %>% summarise(count = n())
+
+masters_gender_summary <- 
+     masters %>% group_by(gender) %>%
+     summarise(count = n())
+
+masters_country_gender_summary <- 
+     masters %>% group_by(country, gender) %>% 
+     summarise(count = n()) %>% ungroup() %>%
+     spread(gender, count) %>%
+     mutate(Female = ifelse(is.na(Female), 0, Female),
+            Male = ifelse(is.na(Male), 0, Male),
+            Female_pct = 100 * round(Female / (Female + Male), 2)) %>%
+     arrange(desc(Female))
+
+masters_country_gender_summary
+
+ggplot(masters_country_gender_summary %>% gather(gender, count, Female:Male) %>% mutate(country = factor(country))) + 
+     geom_bar(aes(fct_reorder(country, -count), count, fill = gender), stat = "identity", position = "stack") +
+     theme(axis.text.x = element_text(angle = 90, size = 6, vjust = .5)) +
+     ggtitle("Chess Masters by Country & Gender") + xlab("") + ylab("# Players")
+
+```
+
+### Get Pairing Data
+```{r Get Pairing Data}
+pairing_list <- vector(mode = "list", length = 10)
+pairing_page <- function(i) paste0("http://www.chess-results.com/tnr257693.aspx?lan=1&art=2&rd=", i, "&turdet=YES&wi=821")
+for(i in 1:10){
+     page_html <- read_html(pairing_page(i))
+     pairing <- page_html %>% html_nodes(".CRs1") %>% html_table() %>% .[[1]]
+     names(pairing) <- pairing[1,]
+     names(pairing)[1] <- "board_id"
+     names(pairing)[c(2:4,10,11,14)] <- c("player1_id", "X1", "player1_name", 
+                                          "X2", "player2_name", "player2_id")
+     pairing <- pairing[c(1,2,4,14,11)] %>% slice(-1) %>% mutate(round = i)
+     
+     pairing_list[[i]] <- pairing
+}
+pairing <- bind_rows(pairing_list)
+pairing <- 
+     pairing %>% 
+     left_join(masters %>% select(player_id, gender), by = c("player1_id" = "player_id")) %>%
+     rename(player1_gender = gender) %>%
+     left_join(masters %>% select(player_id, gender), by = c("player2_id" = "player_id")) %>%
+     rename(player2_gender = gender) %>%
+     mutate(game_type = ifelse(is.na(player2_gender), "unmatched", 
+                               ifelse(player1_gender == "Female" & player2_gender == "Female", "F-F",
+                                      ifelse(player1_gender == "Male" & player2_gender == "Male", "M-M",
+                                      ifelse(player1_gender != player2_gender, "mixed", "weird")))))
+
+```
+
+### Summarize pairing data
+```{r Summarize pairing data}
+pairing %>% group_by(game_type) %>% summarise(num_games = n()) %>% arrange(desc(num_games))
+
+pairing %>% 
+     filter(game_type == "F-F") %>% 
+     select(player1_name, player2_name) %>% 
+     gather(player_num, player_name) %>% 
+     group_by(player_name) %>% summarise(num_Female_Female_Matches = n()) %>% 
+     arrange(desc(num_Female_Female_Matches)) %>% 
+     ggplot(aes(fct_reorder(player_name, num_Female_Female_Matches), num_Female_Female_Matches)) + geom_bar(stat = "identity") +
+     coord_flip() + scale_y_continuous(breaks = 0:7) +
+     xlab("") + ylab("") + 
+ggtitle("2017 Tradewise Gibraltar Chess Tournament", subtitle = "Number of Female-Female Matches") +
+     theme(axis.text.y = element_text(vjust = .3))
+```
